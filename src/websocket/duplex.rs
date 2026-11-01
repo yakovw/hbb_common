@@ -3,7 +3,7 @@
 use super::{Encrypt, WsMessage, WsStream, DEFAULT_MAX_MESSAGE_SIZE};
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use serde::Serialize;
+use serde_derive::Serialize;
 use std::{io, pin::Pin, sync::{Arc, Mutex, Weak, atomic::{AtomicBool, AtomicU64, Ordering}},
     task::{Context, Poll}, time::{Duration, Instant}};
 use tokio::{sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore}, task::JoinHandle};
