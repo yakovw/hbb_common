@@ -38,6 +38,9 @@ use tungstenite::client::IntoClientRequest;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 
+mod duplex;
+pub use duplex::{DesktopDuplexConfig, DesktopDuplexMonitor, DesktopDuplexStats, VideoTiming};
+
 // macOS/iOS Native TLS may wait for a response without flushing the proxy tunnel's write buffer.
 struct FlushBeforeRead(DynTcpStream);
 
@@ -80,7 +83,8 @@ type WsStream = Either<
 >;
 
 pub struct WsFramedStream {
-    stream: WsStream,
+    stream: Option<WsStream>,
+    duplex: Option<duplex::Duplex>,
     addr: SocketAddr,
     encrypt: Option<Encrypt>,
     send_timeout: u64,
@@ -306,7 +310,8 @@ impl WsFramedStream {
             Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout).await?;
 
         let ws = Self {
-            stream,
+            stream: Some(stream),
+            duplex: None,
             addr,
             encrypt: None,
             send_timeout: ms_timeout,
@@ -317,6 +322,7 @@ impl WsFramedStream {
 
     #[inline]
     pub fn set_raw(&mut self) {
+        if let Some(duplex) = &self.duplex { duplex.fail("Cannot change framing after desktop handoff"); return; }
         self.encrypt = None;
     }
 
@@ -330,10 +336,12 @@ impl WsFramedStream {
             c.max_message_size = Some(n.min(DEFAULT_MAX_MESSAGE_SIZE));
             c.max_frame_size = Some(n.min(DEFAULT_MAX_FRAME_SIZE));
         };
-        match &mut self.stream {
+        let configure = |stream: &mut WsStream| match stream {
             Either::Left(stream) => stream.set_config(set_config),
             Either::Right(stream) => stream.set_config(set_config),
-        }
+        };
+        if let Some(stream) = &mut self.stream { configure(stream); }
+        else if let Some(duplex) = &self.duplex { duplex.configure(configure); }
     }
 
     #[inline]
@@ -348,6 +356,7 @@ impl WsFramedStream {
 
     #[inline]
     pub fn set_key(&mut self, key: Key) {
+        if let Some(duplex) = &self.duplex { duplex.fail("Cannot rekey after desktop handoff"); return; }
         self.encrypt = Some(Encrypt::new(key));
     }
 
@@ -358,13 +367,45 @@ impl WsFramedStream {
         is_initiator: bool,
         t: &KxTranscript,
     ) -> ResultType<()> {
+        if let Some(duplex) = &self.duplex { duplex.fail("Cannot rekey after desktop handoff"); bail!("Cannot rekey desktop transport"); }
         self.encrypt = Some(Encrypt::new_split(key, is_initiator, t)?);
         Ok(())
     }
 
     #[inline]
     pub fn is_secured(&self) -> bool {
-        self.encrypt.is_some()
+        self.duplex.as_ref().map_or(self.encrypt.is_some(), |duplex| duplex.secured())
+    }
+
+    /// Call only after handshake/login framing and packet limits are final.
+    /// Thereafter sends acknowledge bounded plaintext admission, not wire delivery.
+    pub fn start_desktop_duplex(&mut self, config: DesktopDuplexConfig) -> Option<DesktopDuplexMonitor> {
+        if let Some(duplex) = &self.duplex { return Some(duplex.monitor()); }
+        tokio::runtime::Handle::try_current().ok()?;
+        let stream = self.stream.take()?;
+        let duplex = duplex::Duplex::new(stream, self.encrypt.take(), config);
+        let monitor = duplex.monitor();
+        self.duplex = Some(duplex);
+        Some(monitor)
+    }
+    pub fn desktop_video_ready(&self) -> bool { self.duplex.as_ref().map_or(true, |duplex| duplex.video_ready()) }
+    pub fn desktop_video_writing(&self) -> bool { self.duplex.as_ref().map_or(false, |duplex| duplex.video_writing()) }
+    pub fn desktop_duplex_active(&self) -> bool { self.duplex.is_some() }
+    pub async fn shutdown_desktop_duplex(&mut self) -> ResultType<()> {
+        if let Some(duplex) = &mut self.duplex { duplex.shutdown(self.send_timeout).await?; }
+        Ok(())
+    }
+    pub async fn send_video(&mut self, message: &impl Message) -> ResultType<()> {
+        if let Some(duplex) = &mut self.duplex {
+            duplex.send(Bytes::from(message.write_to_bytes()?), true, true, false, self.send_timeout)?;
+            Ok(())
+        } else { self.send(message).await }
+    }
+    pub async fn send_terminal(&mut self, message: &impl Message) -> ResultType<()> {
+        if let Some(duplex) = &mut self.duplex {
+            duplex.send(Bytes::from(message.write_to_bytes()?), true, false, true, self.send_timeout)?;
+            Ok(())
+        } else { self.send(message).await }
     }
 
     #[inline]
@@ -374,6 +415,10 @@ impl WsFramedStream {
 
     #[inline]
     pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
+        if let Some(duplex) = &mut self.duplex {
+            duplex.send(Bytes::from(msg), true, false, false, self.send_timeout)?;
+            return Ok(());
+        }
         let mut msg = msg;
         if let Some(key) = self.encrypt.as_mut() {
             msg = key.enc(&msg);
@@ -382,22 +427,27 @@ impl WsFramedStream {
     }
 
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        if let Some(duplex) = &mut self.duplex {
+            duplex.send(bytes, false, false, false, self.send_timeout)?;
+            return Ok(());
+        }
         let msg = WsMessage::Binary(bytes);
         if self.send_timeout > 0 {
             timeout(
                 Duration::from_millis(self.send_timeout),
-                self.stream.send(msg),
+                self.stream.as_mut().expect("owned WebSocket transport").send(msg),
             )
             .await??
         } else {
-            self.stream.send(msg).await?
+            self.stream.as_mut().expect("owned WebSocket transport").send(msg).await?
         };
         Ok(())
     }
 
     #[inline]
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
-        while let Some(msg) = self.stream.next().await {
+        if let Some(duplex) = &mut self.duplex { return duplex.next().await; }
+        while let Some(msg) = self.stream.as_mut().expect("owned WebSocket transport").next().await {
             let msg = match msg {
                 Ok(msg) => msg,
                 Err(e) => {
@@ -544,7 +594,8 @@ mod tests {
                 .await;
 
         WsFramedStream {
-            stream: Either::Left(ws_stream),
+            stream: Some(Either::Left(ws_stream)),
+            duplex: None,
             addr,
             encrypt: None,
             send_timeout: 0,

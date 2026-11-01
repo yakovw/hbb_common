@@ -339,6 +339,7 @@ impl AsyncWrite for DynTcpStream {
 impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
+    pub fn has_separate_receive_key(&self) -> bool { self.3.is_some() }
     pub fn new(key: Key) -> Self {
         Self(key, 0, 0, None)
     }

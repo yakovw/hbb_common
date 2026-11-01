@@ -14,6 +14,28 @@ pub enum Stream {
 }
 
 impl Stream {
+    pub fn start_desktop_duplex(&mut self, config: websocket::DesktopDuplexConfig) -> Option<websocket::DesktopDuplexMonitor> {
+        if let Self::WebSocket(stream) = self { stream.start_desktop_duplex(config) } else { None }
+    }
+    pub fn desktop_video_ready(&self) -> bool {
+        if let Self::WebSocket(stream) = self { stream.desktop_video_ready() } else { true }
+    }
+    pub fn desktop_video_writing(&self) -> bool {
+        if let Self::WebSocket(stream) = self { stream.desktop_video_writing() } else { false }
+    }
+    pub fn desktop_duplex_active(&self) -> bool {
+        if let Self::WebSocket(stream) = self { stream.desktop_duplex_active() } else { false }
+    }
+    pub async fn shutdown_desktop_duplex(&mut self) -> ResultType<()> {
+        if let Self::WebSocket(stream) = self { stream.shutdown_desktop_duplex().await?; }
+        Ok(())
+    }
+    pub async fn send_video(&mut self, message: &impl protobuf::Message) -> ResultType<()> {
+        if let Self::WebSocket(stream) = self { stream.send_video(message).await } else { self.send(message).await }
+    }
+    pub async fn send_terminal(&mut self, message: &impl protobuf::Message) -> ResultType<()> {
+        if let Self::WebSocket(stream) = self { stream.send_terminal(message).await } else { self.send(message).await }
+    }
     #[inline]
     pub fn set_send_timeout(&mut self, ms: u64) {
         match self {

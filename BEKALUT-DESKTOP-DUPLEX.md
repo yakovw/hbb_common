@@ -1,0 +1,13 @@
+# Opt-in post-authentication desktop WebSocket ownership
+
+Fork baseline: official `5d52530b636fb296a324260b074780cf559e0093`. This change does not import the later trusted-device migration, change key negotiation or enable itself in upstream callers.
+
+Call `Stream::start_desktop_duplex` only after handshake/login writes and final packet limits. Existing TCP/WebRTC and ordinary WebSocket callers retain their prior behavior. In duplex mode, sends acknowledge bounded plaintext admission, not peer receipt. One writer owns encryption and FIFO application writes; one reader owns decryption. The consuming boundary clones existing cipher state once for the read-only direction; only the writer calls enc and only the reader calls dec. Nonce algorithms and existing legacy/split-key negotiation are unchanged. Rekey/framing changes after handoff fail the connection.
+
+Budgets: one outstanding video message;64 control messages and64MiB plaintext per control/video class;32 received messages and64MiB receive credit, plus one message being read/decrypted and the current caller's message. The original64MiB message/16MiB frame ceilings remain. These are conservative candidate limits, not a completed mixed-load scheduler; overload closes the connection instead of silently discarding a protected message and continuing. Video producers must wait for `desktop_video_ready`/notification before admitting another encoded frame. No dependent encoded frame is arbitrarily dropped during an active connection.
+
+`send_terminal` reserves a64KiB terminal record and retires earlier queued plaintext before encryption. An already committed encrypted record finishes or fails; its state is never resumed on a different connection. `shutdown_desktop_duplex` retires pending work, drains the explicit close record and aborts/joins both owners with bounded waits. Drop provides cancellation fallback. Transport instances/channels are never shared across connection generations.
+
+The shared protocol lock covers a single nonblocking poll, never an awaited send. The pinned tokio-tungstenite `c241b11` implementation provides separate read/write waker proxies, including read-triggered pong/flush writes. TLS/proxy behavior and verification are unchanged. The weak monitor exposes counts/budgets/key mode without packet content or addresses. Optional video-writer diagnostic delay is capped at2s and expires60s after handoff; it is not a network-latency benchmark.
+
+No tests were created or run. Root-product canonical and ordinary authenticated operational acceptance must be recorded before production enablement. The existing test fixture constructor was adapted only for the new optional ownership field.
