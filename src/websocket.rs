@@ -203,9 +203,9 @@ impl WsFramedStream {
             .await??
             .map(Either::Right)
         } else {
-            // Match direct TCP and proxy sockets: interactive control messages
-            // must not wait for an acknowledgement of a preceding small write.
-            let disable_nagle = true;
+            // Controlled comparison on new direct WS/WSS connections. Preserve
+            // the existing default until latency and bulk-load evidence agree.
+            let disable_nagle = std::env::var("BEKALUT_WSS_TCP_NODELAY").as_deref() == Ok("1");
             timeout(
                 Duration::from_millis(ms_timeout),
                 connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
