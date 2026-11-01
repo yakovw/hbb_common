@@ -203,7 +203,9 @@ impl WsFramedStream {
             .await??
             .map(Either::Right)
         } else {
-            let disable_nagle = false;
+            // Match direct TCP and proxy sockets: interactive control messages
+            // must not wait for an acknowledgement of a preceding small write.
+            let disable_nagle = true;
             timeout(
                 Duration::from_millis(ms_timeout),
                 connect_async_tls_with_config(request, ws_config, disable_nagle, connector),

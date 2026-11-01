@@ -32,7 +32,7 @@ struct Shared {
     video_bytes: Arc<Semaphore>, terminal_bytes: Arc<Semaphore>, receive_bytes: Arc<Semaphore>, video_ready: Arc<Notify>,
     video_inflight: AtomicBool, video_writing: AtomicBool, closing: AtomicBool, admitted: AtomicU64,
     written_packets: AtomicU64, retired_packets: AtomicU64,
-    received: AtomicU64, delivered: AtomicU64, key_mode: &'static str,
+    received: AtomicU64, delivered: AtomicU64, key_mode: &'static str, tcp_nodelay: Option<bool>,
     observer: Option<Arc<dyn Fn(VideoTiming) + Send + Sync>>, started: Instant, delay: Duration,
 }
 impl Shared {
@@ -95,7 +95,7 @@ struct Inbound { bytes: BytesMut, _bytes: OwnedSemaphorePermit }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopDuplexStats {
-    key_mode: &'static str, video_inflight: bool, video_writing: bool, closing: bool,
+    key_mode: &'static str, tcp_nodelay: Option<bool>, video_inflight: bool, video_writing: bool, closing: bool,
     admitted_packets: u64, written_packets: u64, retired_packets: u64, received_packets: u64, delivered_packets: u64,
     outstanding_control_packets: usize, outstanding_control_bytes: usize,
     outstanding_video_bytes: usize, buffered_receive_bytes: usize,
@@ -107,7 +107,7 @@ pub struct DesktopDuplexMonitor(Weak<Shared>);
 impl DesktopDuplexMonitor {
     pub fn snapshot(&self) -> Option<DesktopDuplexStats> {
         let shared = self.0.upgrade()?;
-        Some(DesktopDuplexStats { key_mode:shared.key_mode,
+        Some(DesktopDuplexStats { key_mode:shared.key_mode, tcp_nodelay:shared.tcp_nodelay,
             video_inflight:shared.video_inflight.load(Ordering::Acquire), video_writing:shared.video_writing.load(Ordering::Relaxed),
             closing:shared.closing.load(Ordering::Acquire), admitted_packets:shared.admitted.load(Ordering::Relaxed),
             written_packets:shared.written_packets.load(Ordering::Relaxed), retired_packets:shared.retired_packets.load(Ordering::Relaxed),
@@ -131,13 +131,19 @@ impl Duplex {
     pub fn new(io: WsStream, encrypt: Option<Encrypt>, config: DesktopDuplexConfig) -> Self {
         let (failure_tx, failure) = watch::channel(None);
         let (written_tx, written) = watch::channel(0);
+        // Query the actual TCP socket below TLS. A type-erased proxy transport
+        // cannot be inspected here and must remain unknown in diagnostics.
+        let tcp_nodelay = match &io {
+            super::Either::Left(stream) => stream.get_ref().get_ref().nodelay().ok(),
+            super::Either::Right(_) => None,
+        };
         let key_mode = encrypt.as_ref().map_or("none", |key| if key.has_separate_receive_key() { "split-v1" } else { "legacy" });
         let shared = Arc::new(Shared { io:Arc::new(Mutex::new(io)), failure:failure_tx, written:written_tx,
             control_count:Arc::new(Semaphore::new(CONTROL_PACKETS)), control_bytes:Arc::new(Semaphore::new(BYTE_BUDGET)),
             video_bytes:Arc::new(Semaphore::new(BYTE_BUDGET)), terminal_bytes:Arc::new(Semaphore::new(TERMINAL_BYTES)), receive_bytes:Arc::new(Semaphore::new(BYTE_BUDGET)),
             video_ready:config.video_ready, video_inflight:AtomicBool::new(false), video_writing:AtomicBool::new(false),
             closing:AtomicBool::new(false), admitted:AtomicU64::new(0), written_packets:AtomicU64::new(0), retired_packets:AtomicU64::new(0), received:AtomicU64::new(0), delivered:AtomicU64::new(0),
-            key_mode, observer:config.video_observer, started:Instant::now(), delay:config.diagnostic_video_delay.min(Duration::from_secs(2)) });
+            key_mode, tcp_nodelay, observer:config.video_observer, started:Instant::now(), delay:config.diagnostic_video_delay.min(Duration::from_secs(2)) });
         let (tx, outgoing) = mpsc::channel(CONTROL_PACKETS + 2);
         let (incoming, rx) = mpsc::channel(RECEIVE_PACKETS);
         // Clone once at the consuming handoff: the reader exclusively calls dec,
