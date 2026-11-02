@@ -35,6 +35,8 @@ pub trait StreamBudget: Send + Sync {
     /// Reserve serialized payload before sending, or charge it before delivery.
     /// A cancelled/partial send is not refunded: its wire outcome is uncertain.
     fn charge(&self, bytes: u64, outgoing: bool) -> std::io::Result<()>;
+    /// Only bounded closing protocol; implementations may reserve this inside their limits.
+    fn charge_terminal(&self, bytes: u64, outgoing: bool) -> std::io::Result<()> { self.charge(bytes, outgoing) }
 }
 
 impl Stream {
@@ -96,7 +98,7 @@ impl Stream {
     pub async fn send_terminal(&mut self, message: &impl protobuf::Message) -> ResultType<()> {
         #[cfg(feature = "stream-budget")]
         if let Self::Budgeted { stream, policy } = self {
-            policy.charge(message.compute_size(), true)?;
+            policy.charge_terminal(message.compute_size(), true)?;
             return budgeted_io!(stream, send(message), send_terminal, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()));
         }
         if let Self::WebSocket(stream) = self { stream.send_terminal(message).await } else { self.send(message).await }
@@ -403,6 +405,20 @@ impl Stream {
             Self::WebSocket(ws) => ws.send(msg).await,
             Self::Tcp(tcp) => tcp.send(msg).await,
         }
+    }
+
+    /// Closing-only receive. The caller must discard everything except its terminal acknowledgement.
+    #[cfg(feature = "stream-budget")]
+    pub async fn next_terminal(&mut self) -> Option<Result<bytes::BytesMut, std::io::Error>> {
+        if let Self::Budgeted { stream, policy } = self {
+            let value = budgeted_io!(stream, next(), next,
+                Some(Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream"))));
+            return match value {
+                Some(Ok(bytes)) => Some(policy.charge_terminal(bytes.len() as u64, false).map(|_| bytes)),
+                value => value,
+            };
+        }
+        self.next().await
     }
 
     /// receive message
