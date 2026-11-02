@@ -1,5 +1,5 @@
 //! Opt-in connection spans, with the pinned connector and no endpoint/payload data.
-use std::{future::Future, sync::Arc, time::{Duration, Instant}};
+use std::{convert::TryFrom, future::Future, sync::Arc, time::{Duration, Instant}};
 use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream};
 use tokio_tungstenite::{client_async_tls_with_config, client_async_with_config,
     Connector, MaybeTlsStream, WebSocketStream};
