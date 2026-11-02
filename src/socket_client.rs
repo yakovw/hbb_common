@@ -131,6 +131,12 @@ pub async fn connect_tcp<
     target: T,
     ms_timeout: u64,
 ) -> ResultType<crate::Stream> {
+    connect_tcp_with_observer(target, ms_timeout, None).await
+}
+
+pub async fn connect_tcp_with_observer<
+    't, T: IntoTargetAddr<'t> + ToSocketAddrs + IsResolvedSocketAddr + std::fmt::Display,
+>(target: T, ms_timeout: u64, observer: Option<websocket::ConnectObserver>) -> ResultType<crate::Stream> {
     #[cfg(feature = "webrtc")]
     if is_webrtc_endpoint(&target.to_string()) {
         return Ok(Stream::WebRTC(
@@ -140,7 +146,7 @@ pub async fn connect_tcp<
     let target_str = check_ws(&target.to_string());
     if is_ws_endpoint(&target_str) {
         return Ok(Stream::WebSocket(
-            websocket::WsFramedStream::new(target_str, None, ms_timeout).await?,
+            websocket::WsFramedStream::new_with_observer(target_str, None, ms_timeout, observer).await?,
         ));
     }
     connect_tcp_local(target, None, ms_timeout).await

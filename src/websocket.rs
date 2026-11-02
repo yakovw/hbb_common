@@ -40,6 +40,8 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 
 mod duplex;
 pub use duplex::{DesktopDuplexConfig, DesktopDuplexMonitor, DesktopDuplexStats, VideoTiming};
+mod connect_timing;
+pub use connect_timing::{ConnectEvent, ConnectObserver};
 
 // macOS/iOS Native TLS may wait for a response without flushing the proxy tunnel's write buffer.
 struct FlushBeforeRead(DynTcpStream);
@@ -125,6 +127,7 @@ impl WsFramedStream {
         local_addr: Option<SocketAddr>,
         proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
+        observer: Option<ConnectObserver>,
     ) -> ResultType<(WsStream, SocketAddr)> {
         let tls_type = get_cached_tls_type(url);
         let is_tls_type_cached = tls_type.is_some();
@@ -139,6 +142,8 @@ impl WsFramedStream {
             is_tls_type_cached,
             danger_accept_invalid_cert,
             danger_accept_invalid_cert,
+            observer,
+            0,
         )
         .await
     }
@@ -153,13 +158,20 @@ impl WsFramedStream {
         is_tls_type_cached: bool,
         danger_accept_invalid_cert: Option<bool>,
         original_danger_accept_invalid_certs: Option<bool>,
+        observer: Option<ConnectObserver>,
+        attempt_index: u8,
     ) -> ResultType<(WsStream, SocketAddr)> {
         let ws_config = None;
         let request = url
             .into_client_request()
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        let connector =
-            Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
+        let phases = connect_timing::Attempt::new(observer.clone(), attempt_index,
+            match tls_type { TlsType::Plain => "plain", TlsType::NativeTls => "native-tls", TlsType::Rustls => "rustls" },
+            danger_accept_invalid_cert.unwrap_or(false));
+        let span = phases.start("connector-build");
+        let connector = Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false));
+        if let Some(span) = span { span.finish(connector.is_ok()); }
+        let connector = connector?;
         let result = if let Some(proxy_conf) = proxy_conf {
             let host = request.uri().host().ok_or_else(|| {
                 Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL: no host")
@@ -177,12 +189,12 @@ impl WsFramedStream {
                 })?;
             let target = format!("{host}:{port}");
             timeout(Duration::from_millis(ms_timeout), async {
-                let stream = crate::tcp::FramedStream::connect(
+                let stream = connect_timing::measured(&phases, "proxy-tunnel", crate::tcp::FramedStream::connect(
                     target.as_str(),
                     local_addr,
                     proxy_conf,
                     ms_timeout,
-                )
+                ))
                 .await?;
                 let addr = stream.1;
                 let mut stream = stream.0.into_inner();
@@ -195,9 +207,11 @@ impl WsFramedStream {
                     stream = DynTcpStream(Box::new(FlushBeforeRead(stream)));
                 }
                 Ok::<_, anyhow::Error>(
-                    client_async_tls_with_config(request, stream, ws_config, connector)
-                        .await
-                        .map(|(stream, _)| (stream, addr)),
+                    if phases.enabled() {
+                        connect_timing::handshake(request, stream, ws_config, connector, &phases).await
+                    } else {
+                        client_async_tls_with_config(request, stream, ws_config, connector).await
+                    }.map(|(stream, _)| (stream, addr)),
                 )
             })
             .await??
@@ -208,7 +222,13 @@ impl WsFramedStream {
             let disable_nagle = std::env::var("BEKALUT_WSS_TCP_NODELAY").as_deref() == Ok("1");
             timeout(
                 Duration::from_millis(ms_timeout),
-                connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
+                async {
+                    if phases.enabled() {
+                        connect_timing::direct(request, ws_config, disable_nagle, connector, &phases).await
+                    } else {
+                        connect_async_tls_with_config(request, ws_config, disable_nagle, connector).await
+                    }
+                },
             )
             .await?
             .map(|(stream, _)| Either::Left(stream))
@@ -242,6 +262,8 @@ impl WsFramedStream {
                         is_tls_type_cached,
                         Some(true),
                         original_danger_accept_invalid_certs,
+                        observer,
+                        attempt_index.saturating_add(1),
                     )
                     .await
                 }
@@ -260,6 +282,8 @@ impl WsFramedStream {
                         is_tls_type_cached,
                         original_danger_accept_invalid_certs,
                         original_danger_accept_invalid_certs,
+                        observer,
+                        attempt_index.saturating_add(1),
                     )
                     .await
                 }
@@ -278,6 +302,8 @@ impl WsFramedStream {
                         is_tls_type_cached,
                         Some(true),
                         original_danger_accept_invalid_certs,
+                        observer,
+                        attempt_index.saturating_add(1),
                     )
                     .await
                 }
@@ -307,6 +333,12 @@ impl WsFramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        Self::new_with_observer(url, local_addr, ms_timeout, None).await
+    }
+
+    pub async fn new_with_observer<T: AsRef<str>>(
+        url: T, local_addr: Option<SocketAddr>, ms_timeout: u64, observer: Option<ConnectObserver>,
+    ) -> ResultType<Self> {
         let proxy_conf = Config::get_socks();
         // One caller-owned budget includes the existing TLS/backend fallbacks;
         // a retry must not renew the whole establishment timeout.
@@ -316,7 +348,7 @@ impl WsFramedStream {
             format!("WebSocket establishment failed: timed out after {} ms", ms_timeout));
         let (stream, addr) =
             timeout(budget,
-                Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout))
+                Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout, observer))
                 .await.map_err(|_| expired())??;
         // Timeout cannot preempt synchronous connector work. Even if that work
         // finishes Ready after the budget, drop the socket rather than adopt it.
