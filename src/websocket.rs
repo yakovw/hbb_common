@@ -318,11 +318,17 @@ impl WsFramedStream {
                 _ => bail!("WebSocket establishment failed: deadline override must be between 50 ms and the requested timeout"),
             },
         };
+        let budget = Duration::from_millis(deadline_ms);
+        let started = std::time::Instant::now();
+        let expired = || Error::new(ErrorKind::TimedOut,
+            format!("WebSocket establishment failed: timed out after {} ms", deadline_ms));
         let (stream, addr) =
-            timeout(Duration::from_millis(deadline_ms),
+            timeout(budget,
                 Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout))
-                .await.map_err(|_| Error::new(ErrorKind::TimedOut,
-                    format!("WebSocket establishment failed: timed out after {} ms", deadline_ms)))??;
+                .await.map_err(|_| expired())??;
+        // Timeout cannot preempt synchronous connector work. Even if that work
+        // finishes Ready after the budget, drop the socket rather than adopt it.
+        if started.elapsed() > budget { return Err(expired().into()); }
 
         let ws = Self {
             stream: Some(stream),
