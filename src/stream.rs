@@ -5,40 +5,107 @@ use sodiumoxide::crypto::secretbox::Key;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
+// Dispatch to the concrete transport, not recursively to Stream's async methods:
+// the product pins Rust1.75, before boxed recursive async calls were supported.
+#[cfg(feature = "stream-budget")]
+macro_rules! budgeted_io {
+    ($stream:expr, $method:ident($($argument:expr),*), $websocket:ident, $nested:expr) => {
+        match $stream.as_mut() {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(stream) => stream.$method($($argument),*).await,
+            Stream::WebSocket(stream) => stream.$websocket($($argument),*).await,
+            Stream::Tcp(stream) => stream.$method($($argument),*).await,
+            Stream::Budgeted { .. } => $nested,
+        }
+    };
+}
+
 // support Websocket and tcp.
 pub enum Stream {
+    #[cfg(feature = "stream-budget")]
+    Budgeted { stream: Box<Stream>, policy: std::sync::Arc<dyn StreamBudget> },
     #[cfg(feature = "webrtc")]
     WebRTC(webrtc::WebRTCStream),
     WebSocket(websocket::WsFramedStream),
     Tcp(tcp::FramedStream),
 }
 
+#[cfg(feature = "stream-budget")]
+pub trait StreamBudget: Send + Sync {
+    /// Reserve serialized payload before sending, or charge it before delivery.
+    /// A cancelled/partial send is not refunded: its wire outcome is uncertain.
+    fn charge(&self, bytes: u64, outgoing: bool) -> std::io::Result<()>;
+}
+
 impl Stream {
+    #[cfg(feature = "stream-budget")]
+    pub fn with_budget(self, policy: std::sync::Arc<dyn StreamBudget>) -> ResultType<Self> {
+        if matches!(&self, Self::Budgeted { .. }) { bail!("Stream already has an admission budget"); }
+        Ok(Self::Budgeted { stream: Box::new(self), policy })
+    }
+
+    #[cfg(feature = "stream-budget")]
+    pub fn transport_kind(&self) -> &'static str {
+        match self {
+            Self::Budgeted { stream, .. } => stream.transport_kind(),
+            #[cfg(feature = "webrtc")]
+            Self::WebRTC(_) => "webrtc",
+            Self::WebSocket(_) => "websocket",
+            Self::Tcp(_) => "tcp",
+        }
+    }
+
     pub fn start_desktop_duplex(&mut self, config: websocket::DesktopDuplexConfig) -> Option<websocket::DesktopDuplexMonitor> {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, .. } = self { return stream.start_desktop_duplex(config); }
         if let Self::WebSocket(stream) = self { stream.start_desktop_duplex(config) } else { None }
     }
     pub fn desktop_video_ready(&self) -> bool {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, .. } = self { return stream.desktop_video_ready(); }
         if let Self::WebSocket(stream) = self { stream.desktop_video_ready() } else { true }
     }
     pub fn desktop_video_writing(&self) -> bool {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, .. } = self { return stream.desktop_video_writing(); }
         if let Self::WebSocket(stream) = self { stream.desktop_video_writing() } else { false }
     }
     pub fn desktop_duplex_active(&self) -> bool {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, .. } = self { return stream.desktop_duplex_active(); }
         if let Self::WebSocket(stream) = self { stream.desktop_duplex_active() } else { false }
     }
     pub async fn shutdown_desktop_duplex(&mut self) -> ResultType<()> {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, .. } = self {
+            if matches!(stream.as_ref(), Self::Budgeted { .. }) { bail!("Nested admission stream"); }
+            if let Self::WebSocket(stream) = stream.as_mut() { stream.shutdown_desktop_duplex().await?; }
+            return Ok(());
+        }
         if let Self::WebSocket(stream) = self { stream.shutdown_desktop_duplex().await?; }
         Ok(())
     }
     pub async fn send_video(&mut self, message: &impl protobuf::Message) -> ResultType<()> {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, policy } = self {
+            policy.charge(message.compute_size(), true)?;
+            return budgeted_io!(stream, send(message), send_video, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()));
+        }
         if let Self::WebSocket(stream) = self { stream.send_video(message).await } else { self.send(message).await }
     }
     pub async fn send_terminal(&mut self, message: &impl protobuf::Message) -> ResultType<()> {
+        #[cfg(feature = "stream-budget")]
+        if let Self::Budgeted { stream, policy } = self {
+            policy.charge(message.compute_size(), true)?;
+            return budgeted_io!(stream, send(message), send_terminal, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()));
+        }
         if let Self::WebSocket(stream) = self { stream.send_terminal(message).await } else { self.send(message).await }
     }
     #[inline]
     pub fn set_send_timeout(&mut self, ms: u64) {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.set_send_timeout(ms),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.set_send_timeout(ms),
             Stream::WebSocket(s) => s.set_send_timeout(ms),
@@ -49,6 +116,8 @@ impl Stream {
     #[inline]
     pub fn set_raw(&mut self) {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.set_raw(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.set_raw(),
             Stream::WebSocket(s) => s.set_raw(),
@@ -65,6 +134,8 @@ impl Stream {
     #[inline]
     pub fn set_max_packet_length(&mut self, n: usize) {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.set_max_packet_length(n),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.set_max_packet_length(n),
             Stream::WebSocket(s) => s.set_max_packet_length(n),
@@ -75,6 +146,11 @@ impl Stream {
     #[inline]
     pub async fn send_bytes(&mut self, bytes: bytes::Bytes) -> ResultType<()> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, policy } => {
+                policy.charge(bytes.len() as u64, true)?;
+                budgeted_io!(stream, send_bytes(bytes), send_bytes, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()))
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.send_bytes(bytes).await,
             Stream::WebSocket(s) => s.send_bytes(bytes).await,
@@ -85,6 +161,11 @@ impl Stream {
     #[inline]
     pub async fn send_raw(&mut self, bytes: Vec<u8>) -> ResultType<()> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, policy } => {
+                policy.charge(bytes.len() as u64, true)?;
+                budgeted_io!(stream, send_raw(bytes), send_raw, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()))
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.send_raw(bytes).await,
             Stream::WebSocket(s) => s.send_raw(bytes).await,
@@ -95,6 +176,8 @@ impl Stream {
     #[inline]
     pub fn set_key(&mut self, key: Key) {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.set_key(key),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.set_key(key),
             Stream::WebSocket(s) => s.set_key(key),
@@ -118,6 +201,8 @@ impl Stream {
                 Ok(())
             }
             1 => match self {
+                #[cfg(feature = "stream-budget")]
+                Self::Budgeted { stream, .. } => stream.set_negotiated_key(key, is_initiator, t),
                 #[cfg(feature = "webrtc")]
                 Stream::WebRTC(_) => bail!("key exchange version 1 does not apply to WebRTC"),
                 Stream::WebSocket(s) => s.set_key_split(key, is_initiator, t),
@@ -140,6 +225,8 @@ impl Stream {
     #[inline]
     pub fn rx_progress(&self) -> Option<u64> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.rx_progress(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => Some(s.rx_progress()),
             #[allow(unreachable_patterns)]
@@ -156,6 +243,8 @@ impl Stream {
     #[inline]
     pub fn webrtc_disconnected(&self) -> bool {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.webrtc_disconnected(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.is_disconnected(),
             #[allow(unreachable_patterns)]
@@ -166,6 +255,8 @@ impl Stream {
     #[inline]
     pub fn is_secured(&self) -> bool {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.is_secured(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.is_secured(),
             Stream::WebSocket(s) => s.is_secured(),
@@ -178,6 +269,8 @@ impl Stream {
     #[inline]
     pub fn is_webrtc(&self) -> bool {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.is_webrtc(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(_) => true,
             #[allow(unreachable_patterns)]
@@ -200,6 +293,8 @@ impl Stream {
     #[inline]
     pub fn close_webrtc(&self) {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.close_webrtc(),
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.close_detached(),
             #[allow(unreachable_patterns)]
@@ -214,6 +309,12 @@ impl Stream {
     #[inline]
     pub async fn webrtc_relayed(&self) -> Option<bool> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => match stream.as_ref() {
+                #[cfg(feature = "webrtc")]
+                Self::WebRTC(stream) => stream.is_relayed().await,
+                _ => None,
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.is_relayed().await,
             #[allow(unreachable_patterns)]
@@ -227,6 +328,12 @@ impl Stream {
     #[inline]
     pub async fn webrtc_remote_ipv6(&self) -> Option<bool> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => match stream.as_ref() {
+                #[cfg(feature = "webrtc")]
+                Self::WebRTC(stream) => stream.is_remote_ipv6().await,
+                _ => None,
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.is_remote_ipv6().await,
             #[allow(unreachable_patterns)]
@@ -241,6 +348,12 @@ impl Stream {
     #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
     pub async fn dtls_fingerprint(&self, local: bool) -> Option<String> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => match stream.as_ref() {
+                #[cfg(feature = "webrtc")]
+                Self::WebRTC(stream) => if local { stream.local_dtls_fingerprint().await.ok() } else { stream.remote_dtls_fingerprint().await.ok() },
+                _ => None,
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => {
                 if local {
@@ -260,6 +373,15 @@ impl Stream {
         timeout: u64,
     ) -> Option<Result<bytes::BytesMut, std::io::Error>> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, policy } => {
+                let value = budgeted_io!(stream, next_timeout(timeout), next_timeout,
+                    Some(Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream"))));
+                match value {
+                    Some(Ok(bytes)) => Some(policy.charge(bytes.len() as u64, false).map(|_| bytes)),
+                    value => value,
+                }
+            },
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.next_timeout(timeout).await,
             Stream::WebSocket(s) => s.next_timeout(timeout).await,
@@ -271,6 +393,11 @@ impl Stream {
     #[inline]
     pub async fn send(&mut self, msg: &impl protobuf::Message) -> ResultType<()> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, policy } => {
+                policy.charge(msg.compute_size(), true)?;
+                budgeted_io!(stream, send(msg), send, Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream").into()))
+            },
             #[cfg(feature = "webrtc")]
             Self::WebRTC(s) => s.send(msg).await,
             Self::WebSocket(ws) => ws.send(msg).await,
@@ -282,6 +409,15 @@ impl Stream {
     #[inline]
     pub async fn next(&mut self) -> Option<Result<bytes::BytesMut, std::io::Error>> {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, policy } => {
+                let value = budgeted_io!(stream, next(), next,
+                    Some(Err(std::io::Error::new(std::io::ErrorKind::Other, "Nested admission stream"))));
+                match value {
+                    Some(Ok(bytes)) => Some(policy.charge(bytes.len() as u64, false).map(|_| bytes)),
+                    value => value,
+                }
+            },
             #[cfg(feature = "webrtc")]
             Self::WebRTC(s) => s.next().await,
             Self::WebSocket(ws) => ws.next().await,
@@ -292,6 +428,8 @@ impl Stream {
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
         match self {
+            #[cfg(feature = "stream-budget")]
+            Self::Budgeted { stream, .. } => stream.local_addr(),
             #[cfg(feature = "webrtc")]
             Self::WebRTC(s) => s.local_addr(),
             Self::WebSocket(ws) => ws.local_addr(),
@@ -318,6 +456,8 @@ impl Stream {
 /// than scope end — but they are now an optimization rather than the thing correctness rests on.
 impl Drop for Stream {
     fn drop(&mut self) {
+        #[cfg(feature = "stream-budget")]
+        if matches!(self, Self::Budgeted { .. }) { return; } // The owned inner stream performs its normal teardown.
         self.close_webrtc();
     }
 }
