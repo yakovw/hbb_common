@@ -308,20 +308,12 @@ impl WsFramedStream {
         ms_timeout: u64,
     ) -> ResultType<Self> {
         let proxy_conf = Config::get_socks();
-        // One establishment budget covers the existing TLS/backend fallbacks too;
-        // a retry must not renew the caller's whole timeout. A developer may only
-        // shorten it for an ordinary connection, never extend that caller budget.
-        let deadline_ms = match std::env::var_os("BEKALUT_WSS_CONNECT_DEADLINE_MS") {
-            None => ms_timeout,
-            Some(value) => match value.to_str().and_then(|value| value.parse::<u64>().ok()) {
-                Some(value) if value >= 50 && value <= ms_timeout => value,
-                _ => bail!("WebSocket establishment failed: deadline override must be between 50 ms and the requested timeout"),
-            },
-        };
-        let budget = Duration::from_millis(deadline_ms);
+        // One caller-owned budget includes the existing TLS/backend fallbacks;
+        // a retry must not renew the whole establishment timeout.
+        let budget = Duration::from_millis(ms_timeout);
         let started = std::time::Instant::now();
         let expired = || Error::new(ErrorKind::TimedOut,
-            format!("WebSocket establishment failed: timed out after {} ms", deadline_ms));
+            format!("WebSocket establishment failed: timed out after {} ms", ms_timeout));
         let (stream, addr) =
             timeout(budget,
                 Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout))
