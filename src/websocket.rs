@@ -140,6 +140,7 @@ impl WsFramedStream {
             ms_timeout,
             tls_type,
             is_tls_type_cached,
+            false,
             danger_accept_invalid_cert,
             danger_accept_invalid_cert,
             observer,
@@ -155,7 +156,8 @@ impl WsFramedStream {
         proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
         tls_type: TlsType,
-        is_tls_type_cached: bool,
+        backend_is_fixed: bool,
+        strict_backend: bool,
         danger_accept_invalid_cert: Option<bool>,
         original_danger_accept_invalid_certs: Option<bool>,
         observer: Option<ConnectObserver>,
@@ -169,7 +171,11 @@ impl WsFramedStream {
             match tls_type { TlsType::Plain => "plain", TlsType::NativeTls => "native-tls", TlsType::Rustls => "rustls" },
             danger_accept_invalid_cert.unwrap_or(false));
         let span = phases.start("connector-build");
-        let connector = Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false));
+        let connector = Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))
+            .and_then(|connector| {
+                if strict_backend && connector.is_none() { bail!("Requested TLS probe backend unavailable"); }
+                Ok(connector)
+            });
         if let Some(span) = span { span.finish(connector.is_ok()); }
         let connector = connector?;
         let result = if let Some(proxy_conf) = proxy_conf {
@@ -246,7 +252,7 @@ impl WsFramedStream {
                     Either::Right((stream, addr)) => Ok((Either::Right(stream), addr)),
                 }
             }
-            Err(e) => match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
+            Err(e) => match (tls_type, backend_is_fixed, danger_accept_invalid_cert) {
                 (TlsType::Rustls, _, None) => {
                     log::warn!(
                             "WebSocket connection with rustls-tls failed, try accept invalid certs: {}, {:?}",
@@ -259,7 +265,8 @@ impl WsFramedStream {
                         proxy_conf,
                         ms_timeout,
                         tls_type,
-                        is_tls_type_cached,
+                        backend_is_fixed,
+                        strict_backend,
                         Some(true),
                         original_danger_accept_invalid_certs,
                         observer,
@@ -279,7 +286,8 @@ impl WsFramedStream {
                         proxy_conf,
                         ms_timeout,
                         TlsType::NativeTls,
-                        is_tls_type_cached,
+                        backend_is_fixed,
+                        strict_backend,
                         original_danger_accept_invalid_certs,
                         original_danger_accept_invalid_certs,
                         observer,
@@ -299,7 +307,8 @@ impl WsFramedStream {
                         proxy_conf,
                         ms_timeout,
                         tls_type,
-                        is_tls_type_cached,
+                        backend_is_fixed,
+                        strict_backend,
                         Some(true),
                         original_danger_accept_invalid_certs,
                         observer,
@@ -363,6 +372,28 @@ impl WsFramedStream {
         };
 
         Ok(ws)
+    }
+
+    /// Standalone diagnostics select one strict backend without manufacturing a
+    /// failure of the configured default. Ordinary connection policy is unchanged.
+    pub async fn probe_tls_with_observer(
+        url: &str, ms_timeout: u64, tls_type: TlsType, observer: Option<ConnectObserver>,
+    ) -> ResultType<Self> {
+        if !url.starts_with("wss://") || matches!(tls_type, TlsType::Plain) {
+            bail!("Explicit TLS probe requires WSS and a TLS backend");
+        }
+        let proxy_conf = Config::get_socks();
+        let budget = Duration::from_millis(ms_timeout);
+        let started = std::time::Instant::now();
+        let expired = || Error::new(ErrorKind::TimedOut,
+            format!("WebSocket establishment failed: timed out after {} ms", ms_timeout));
+        // An explicit diagnostic choice fixes the backend, not a fabricated cache
+        // entry. Strict certificate validation and a single total budget remain.
+        let (stream, addr) = timeout(budget, Self::try_connect(url, None, proxy_conf.as_ref(),
+            ms_timeout, tls_type, true, true, Some(false), Some(false), observer, 0))
+            .await.map_err(|_| expired())??;
+        if started.elapsed() > budget { return Err(expired().into()); }
+        Ok(Self { stream:Some(stream), duplex:None, addr, encrypt:None, send_timeout:ms_timeout })
     }
 
     #[inline]
